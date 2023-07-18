@@ -23,10 +23,11 @@ import warnings
 
 from . import axes_scan
 from . import meta
-from flax import traceback_util
+from flax import traceback_util, traverse_util
 from .frozen_dict import freeze
 from .frozen_dict import unfreeze
 import jax
+import jax.numpy as jnp
 from jax import random
 from .scope import (CollectionFilter, DenyList, PRNGSequenceFilter,  # pylint: disable=g-multiple-import
                     Filter, Scope, group_collections, in_filter,
@@ -772,13 +773,23 @@ def scan(fn: Callable[..., Any],
         tree_map_rngs(split_fn, rng_group) if split else rng_group
         for rng_group, split in zip(rng_groups, rng_splits))
 
+    carry_vars_new_axes = 0
+    carry_vars_remove = None
     @functools.partial(axes_scan.scan,
                        in_axes=(variable_in_axes, rng_axes, in_axes),
-                       out_axes=(out_axes, variable_out_axes),
+                       out_axes=(out_axes, variable_out_axes, carry_vars_new_axes),
                        length=length, reverse=reverse,
                        unroll=unroll)
     def scanned(broadcast_vars, carry, scan_variable_groups, rng_groups, args):
+      nonlocal carry_vars_remove
+
       carry_vars, c = carry
+
+      # remove new carry vars added with eval_shape
+      if carry_vars_remove is not None:
+        carry_vars = tuple(
+          vars_diff(current, to_remove) for current, to_remove in zip(carry_vars, carry_vars_remove))
+
       variable_groups = (broadcast_vars, carry_vars) + scan_variable_groups
       if data_transform is not None:
         variable_groups, rng_groups = data_transform(variable_groups,
@@ -787,15 +798,28 @@ def scan(fn: Callable[..., Any],
       c, y = fn(scope, c, *args)
       out_vars = repack_fn(scope)
       broadcast_vars_out = out_vars[0]
-      carry_vars = out_vars[1]
+      carry_vars_out = out_vars[1]
       scan_vars = out_vars[2:]
+
+
+      if carry_vars_remove is None:
+        # compute new carry vars, these will be handled as outputs
+        carry_vars_new = tuple(
+          vars_diff(outputs, inputs) for outputs, inputs in zip(carry_vars_out, carry_vars))
+        # remove new carry vars to maintain input shape
+        carry_vars = tuple(
+          vars_diff(outputs, new) for outputs, new in zip(carry_vars_out, carry_vars_new))
+      else:
+        carry_vars = carry_vars_out
+        carry_vars_new = None
+
       # add immutable broadcast vars back to broadcast output
       # otherwise they won't be fed to the actual scan body
       for in_group, out_group in zip(broadcast_vars, broadcast_vars_out):
         for col in in_group:
           if col not in out_group:
             out_group[col] = in_group[col]
-      return broadcast_vars_out, (carry_vars, c), (y, scan_vars)
+      return broadcast_vars_out, (carry_vars, c), (y, scan_vars, carry_vars_new)
 
     broadcast_vars = variable_groups[0]
     carry_vars = variable_groups[1]
@@ -803,14 +827,27 @@ def scan(fn: Callable[..., Any],
     new_scan_vars = []
     for scan_group, axis in zip(scan_vars, variable_in_axes):
       new_scan_vars.append(meta.remove_axis(scan_group, axis, metadata_params))
-    broadcast_vars, (carry_vars, c), (ys, scan_vars) = scanned(
-        broadcast_vars, (carry_vars, init), tuple(new_scan_vars),
-        rng_groups, args)
+
+    # compute new carry vars
+    carry_vars_remove = jax.eval_shape(scanned,
+      broadcast_vars, (carry_vars, init), tuple(new_scan_vars),
+      rng_groups, args)[2][2]
+    # create dummy carry vars and add them to the carry_vars
+    carry_vars_new = jax.tree_map(
+      lambda x: jnp.zeros(x.shape[1:], x.dtype), carry_vars_remove)
+    carry_vars = tuple(
+      vars_merge(existing, new) for existing, new in zip(carry_vars, carry_vars_new))
+    # run scan
+    broadcast_vars, (carry_vars, c), (ys, scan_vars, carry_vars_new) = scanned(
+      broadcast_vars, (carry_vars, init), tuple(new_scan_vars),
+      rng_groups, args)
+    assert carry_vars_new is None
+
     new_scan_vars = []
     for scan_group, axis in zip(scan_vars, variable_out_axes):
       new_scan_vars.append(meta.add_axis(scan_group, axis, metadata_params))
     scan_vars = tuple(new_scan_vars)
-    out_vars = (broadcast_vars, carry_vars,) + scan_vars
+    out_vars = (broadcast_vars, carry_vars) + scan_vars
     return (c, ys), out_vars
 
   return pack(
@@ -1394,3 +1431,22 @@ def remat_scan(
 def _unzip2(xs):
   ys = tuple(zip(*xs))
   return ys if ys else ((), ())
+
+def vars_diff(a, b):
+  a = traverse_util.flatten_dict(a, sep='/')
+  b = traverse_util.flatten_dict(b, sep='/')
+
+  c = {
+    path: value
+    for path, value in a.items()
+    if path not in b
+  }
+  c = traverse_util.unflatten_dict(c, sep='/')
+  return c
+
+def vars_merge(a, b):
+  a = traverse_util.flatten_dict(a, sep='/')
+  b = traverse_util.flatten_dict(b, sep='/')
+  a.update(b)
+  c = traverse_util.unflatten_dict(a, sep='/')
+  return c
